@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import async_timeout
+from collections import defaultdict
 from datetime import timedelta
 import logging
 import json
@@ -19,6 +20,12 @@ import os
 import aiohttp
 
 from homeassistant.core import HomeAssistant
+from homeassistant.components.recorder.statistics import (
+    StatisticData,
+    StatisticMetaData,
+    async_add_external_statistics,
+    get_last_statistics,
+)
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -148,6 +155,115 @@ class LenedaDataUpdateCoordinator(DataUpdateCoordinator):
             except (ValueError, TypeError):
                 continue  # Skip if value is not a valid number
         return round(total_overage_kwh, 4)
+
+    async def _async_push_15m_energy_statistics(
+        self,
+        statistic_id: str,
+        statistic_name: str,
+        items: list[dict],
+    ) -> None:
+        """Push 15-minute historical energy data into Home Assistant statistics.
+
+        Leneda provides power in kW at 15-minute intervals. Home Assistant energy
+        statistics are stored in kWh cumulative sums. For each interval we append:
+          sum += kW * 0.25h
+        """
+        if not items:
+            return
+
+        parsed_items: list[tuple] = []
+        for item in items:
+            started_at = dt_util.parse_datetime(item.get("startedAt", ""))
+            if started_at is None:
+                continue
+            try:
+                value_kw = float(item.get("value"))
+            except (TypeError, ValueError):
+                continue
+            parsed_items.append((started_at, value_kw))
+
+        if not parsed_items:
+            return
+
+        parsed_items.sort(key=lambda x: x[0])
+
+        previous_stats = await get_last_statistics(
+            self.hass,
+            1,
+            statistic_id,
+            True,
+            {"sum", "start"},
+        )
+
+        last_start = None
+        running_sum = 0.0
+        if previous_stats.get(statistic_id):
+            last = previous_stats[statistic_id][0]
+            last_start = last.get("start")
+            running_sum = float(last.get("sum") or 0.0)
+
+        new_stats: list[StatisticData] = []
+        for started_at, value_kw in parsed_items:
+            if last_start and started_at <= last_start:
+                continue
+            running_sum = round(running_sum + (max(0.0, value_kw) * 0.25), 6)
+            new_stats.append(
+                StatisticData(
+                    start=started_at,
+                    state=running_sum,
+                    sum=running_sum,
+                )
+            )
+
+        if not new_stats:
+            return
+
+        metadata = StatisticMetaData(
+            has_mean=False,
+            has_sum=True,
+            name=statistic_name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_of_measurement="kWh",
+        )
+        async_add_external_statistics(self.hass, metadata, new_stats)
+        _LOGGER.debug("Pushed %d external stats rows to %s", len(new_stats), statistic_id)
+
+    async def _async_backfill_yesterday_statistics(
+        self,
+        consumption_items: list[dict],
+        production_items: list[dict],
+    ) -> None:
+        """Backfill yesterday's 15-minute energy intervals into HA statistics."""
+        # Merge production data by timestamp across all configured production meters.
+        merged_production: dict = defaultdict(float)
+        for item in production_items:
+            ts = item.get("startedAt")
+            if not ts:
+                continue
+            try:
+                merged_production[ts] += float(item.get("value") or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+        merged_production_items = [
+            {"startedAt": ts, "value": value}
+            for ts, value in merged_production.items()
+        ]
+
+        consumption_stat_id = f"{DOMAIN}:{self.consumption_meter}:consumption_15m_energy"
+        production_stat_id = f"{DOMAIN}:{self.production_meter}:production_15m_energy"
+
+        await self._async_push_15m_energy_statistics(
+            consumption_stat_id,
+            "Leneda 15m Consumption Energy",
+            consumption_items,
+        )
+        await self._async_push_15m_energy_statistics(
+            production_stat_id,
+            "Leneda 15m Production Energy",
+            merged_production_items,
+        )
 
     async def _async_update_data(self) -> dict[str, float | None]:
         """Fetch data from the Leneda API concurrently."""
@@ -424,6 +540,41 @@ class LenedaDataUpdateCoordinator(DataUpdateCoordinator):
                         # Keep existing value if available for empty responses
                         if obis_code not in data:
                             data[obis_code] = None
+
+                # Backfill detailed 15-min intervals into HA statistics so Energy Dashboard
+                # can attribute usage to the original interval timestamps.
+                try:
+                    consumption_result = next(
+                        (res for obis, res in zip(non_gas_obis_codes.keys(), obis_results) if obis == CONSUMPTION_CODE),
+                        None,
+                    )
+
+                    production_results = await asyncio.gather(
+                        *[
+                            self.api_client.async_get_metering_data(
+                                meter_id,
+                                PRODUCTION_CODE,
+                                yesterday_start_dt,
+                                yesterday_end_dt,
+                            )
+                            for meter_id in self.production_meters
+                        ],
+                        return_exceptions=True,
+                    )
+
+                    consumption_items = (
+                        consumption_result.get("items", [])
+                        if isinstance(consumption_result, dict)
+                        else []
+                    )
+                    production_items: list[dict] = []
+                    for prod_result in production_results:
+                        if isinstance(prod_result, dict):
+                            production_items.extend(prod_result.get("items", []))
+
+                    await self._async_backfill_yesterday_statistics(consumption_items, production_items)
+                except Exception as err:
+                    _LOGGER.warning("Could not backfill external statistics: %s", err)
 
                 _LOGGER.debug("Processing aggregated results...")
                 # Process aggregated results
